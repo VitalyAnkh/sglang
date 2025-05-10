@@ -18,6 +18,7 @@ import logging
 from typing import List, Optional, Tuple, Union
 
 import torch
+import xgrammar
 from xgrammar import (
     CompiledGrammar,
     GrammarCompiler,
@@ -25,13 +26,16 @@ from xgrammar import (
     StructuralTagItem,
     TokenizerInfo,
     allocate_token_bitmask,
-    apply_token_bitmask_inplace,
 )
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.constrained.triton_ops.bitmask_ops import (
+    apply_token_bitmask_inplace_triton,
+)
+from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +58,12 @@ class XGrammarGrammar(BaseGrammarObject):
         self.ctx = ctx
         self.override_stop_tokens = override_stop_tokens
         self.finished = False
+
+        from xgrammar.kernels.apply_token_bitmask_inplace_cpu import (
+            apply_token_bitmask_inplace_cpu,
+        )
+
+        self.apply_vocab_mask_cpu = apply_token_bitmask_inplace_cpu
 
     def accept_token(self, token: int):
         assert self.matcher.accept_token(token)
@@ -97,9 +107,13 @@ class XGrammarGrammar(BaseGrammarObject):
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return vocab_mask.to(device, non_blocking=True)
 
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_token_bitmask_inplace(logits, vocab_mask)
+    def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        if logits.device.type == "cuda":
+            apply_token_bitmask_inplace_triton(logits, vocab_mask)
+        elif logits.device.type == "cpu" and self.apply_vocab_mask_cpu:
+            self.apply_vocab_mask_cpu(logits, vocab_mask)
+        else:
+            raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
     def copy(self):
         matcher = GrammarMatcher(
@@ -136,6 +150,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     def dispatch_json(self, key_string: str) -> Optional[XGrammarGrammar]:
         try:
             if key_string == "$$ANY$$":
+                # Note: This builtin JSON grammar includes *all* valid JSON (including, for example, arrays at the root)
                 ctx = self.grammar_compiler.compile_builtin_json_grammar()
             else:
                 ctx = self.grammar_compiler.compile_json_schema(schema=key_string)

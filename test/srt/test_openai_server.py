@@ -534,6 +534,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
                 },
             ],
             temperature=0,
+            extra_body={"continue_final_message": True},
         )
 
         assert (
@@ -687,7 +688,6 @@ class TestOpenAIServerIgnoreEOS(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
-            other_args=["--chat-template=llama_3_vision"],
         )
         cls.base_url += "/v1"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)

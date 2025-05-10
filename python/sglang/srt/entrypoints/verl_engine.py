@@ -12,7 +12,7 @@
 # limitations under the License.
 # ==============================================================================
 import os
-from typing import Dict, List, Literal, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -37,6 +37,7 @@ class VerlEngine:
         monkey_patch_torch_reductions()
         self._device_mesh_cpu = device_mesh_cpu
         self._tp_rank = device_mesh_cpu.get_local_rank()
+        self._rank = device_mesh_cpu.get_rank()
         self._tp_size = device_mesh_cpu.size()
         tp_size_per_node = self._tp_size // nnodes
         node_rank = self._tp_rank // tp_size_per_node
@@ -114,7 +115,7 @@ class VerlEngine:
         # Most naive implementation, can extract tensor and send via gloo if too slow
         [output] = broadcast_pyobj(
             data=[output],
-            rank=self._tp_rank,
+            rank=self._rank,
             dist_group=self._device_mesh_cpu.get_group(),
             src=self._device_mesh_cpu.mesh[0].item(),
             force_cpu_device=False,
@@ -124,7 +125,7 @@ class VerlEngine:
 
     def update_weights_from_tensor(
         self,
-        named_tensors: List[Tuple[str, torch.Tensor]],
+        named_tensors: Iterable[Tuple[str, torch.Tensor]],
         load_format: Optional[str] = None,
     ):
         # Most naive implementation, can optimize a lot if it is bottleneck
@@ -153,8 +154,11 @@ class VerlEngine:
                         )
                     ],
                     load_format=load_format,
-                    flush_cache=tensor_index == len(named_tensors) - 1,
+                    flush_cache=False,
                 )
+
+        if self._tp_rank == 0:
+            self._engine.flush_cache()
 
     def release_memory_occupation(self):
         if self._tp_rank == 0:
