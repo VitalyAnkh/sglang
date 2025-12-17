@@ -30,7 +30,6 @@ from diffusers.loaders.lora_base import (
 )
 from huggingface_hub import snapshot_download
 from transformers import AutoConfig, PretrainedConfig
-from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
 from sglang.multimodal_gen.runtime.loader.weight_utils import get_lock
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -44,6 +43,16 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = {
     # DbrxConfig.model_type: DbrxConfig,
     # ExaoneConfig.model_type: ExaoneConfig,
     # Qwen2_5_VLConfig.model_type: Qwen2_5_VLConfig,
+}
+
+_GGUF_DIFFUSION_ARCH_TO_PIPELINE: dict[str, str] = {
+    # Diffusion transformer checkpoints stored as GGUF single files.
+    "qwen_image": "QwenImagePipeline",
+}
+
+_GGUF_DIFFUSION_ARCH_TO_BASE_MODEL_ID: dict[str, str] = {
+    # Base diffusers repos that contain all other components besides the transformer.
+    "qwen_image": "Qwen/Qwen-Image",
 }
 
 for name, cls in _CONFIG_REGISTRY.items():
@@ -67,7 +76,9 @@ def get_hf_config(
 ) -> PretrainedConfig:
     is_gguf = check_gguf_file(component_model_path)
     if is_gguf:
-        raise NotImplementedError("GGUF models are not supported.")
+        raise NotImplementedError(
+            "GGUF is not supported for transformers-style component configs."
+        )
 
     config = AutoConfig.from_pretrained(
         component_model_path,
@@ -82,13 +93,6 @@ def get_hf_config(
         config._name_or_path = component_model_path
     if model_override_args:
         config.update(model_override_args)
-
-    # Special architecture mapping check for GGUF models
-    if is_gguf:
-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config.update({"architectures": [model_type]})
 
     return config
 
@@ -197,6 +201,115 @@ def check_gguf_file(model: str | os.PathLike) -> bool:
         header = f.read(4)
     return header == b"GGUF"
 
+def get_gguf_architecture(model_path: str | os.PathLike) -> str | None:
+    """Best-effort parse of GGUF metadata architecture (lowercased)."""
+    try:
+        import gguf  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        reader = gguf.GGUFReader(str(model_path))
+    except Exception:
+        return None
+
+    for key in ("general.architecture", "general.name"):
+        field = reader.get_field(key)
+        if field is None:
+            continue
+        try:
+            val = field.contents()
+        except Exception:
+            continue
+        if val is None:
+            continue
+        if isinstance(val, bytes):
+            try:
+                val = val.decode("utf-8", errors="ignore")
+            except Exception:
+                val = str(val)
+        return str(val).strip().lower()
+    return None
+
+
+def resolve_gguf_diffusion_pipeline_class_name(
+    architecture: str | None, model_ref: str | None = None
+) -> str:
+    """Resolve a diffusion pipeline class name from GGUF architecture metadata."""
+    arch = (architecture or "").strip().lower()
+    if not arch and model_ref:
+        # Heuristic fallback: allow local files without readable metadata.
+        lowered = str(model_ref).lower()
+        if "qwen" in lowered and "image" in lowered:
+            arch = "qwen_image"
+
+    pipeline_name = _GGUF_DIFFUSION_ARCH_TO_PIPELINE.get(arch)
+    if pipeline_name is None:
+        raise ValueError(
+            f"Unsupported GGUF diffusion checkpoint: '{model_ref}'. "
+            f"Detected architecture={architecture!r}. Only Qwen-Image GGUF is supported."
+        )
+    return pipeline_name
+
+
+def resolve_gguf_diffusion_base_model_id(
+    architecture: str | None, model_ref: str | None = None
+) -> str:
+    """Resolve the base diffusers repo ID for a GGUF diffusion checkpoint."""
+    arch = (architecture or "").strip().lower()
+    if not arch and model_ref:
+        lowered = str(model_ref).lower()
+        if "qwen" in lowered and "image" in lowered:
+            arch = "qwen_image"
+
+    base_model_id = _GGUF_DIFFUSION_ARCH_TO_BASE_MODEL_ID.get(arch)
+    if base_model_id is None:
+        raise ValueError(
+            f"Unsupported GGUF diffusion checkpoint: '{model_ref}'. "
+            f"Detected architecture={architecture!r}. Only Qwen-Image GGUF is supported."
+        )
+    return base_model_id
+
+
+def select_default_gguf_filename(candidates: list[str]) -> str:
+    """Pick a default GGUF filename from a repo listing.
+
+    Prefers smaller/more widely supported quantizations first to fit 16GB GPUs.
+    """
+    if not candidates:
+        raise ValueError("No GGUF files found.")
+
+    preferred_order = [
+        "q3_k_m",
+        "q3_k_s",
+        "q2_k",
+        "q4_k_m",
+        "q4_k_s",
+        "q4_1",
+        "q4_0",
+        "q5_k_m",
+        "q5_k_s",
+        "q5_1",
+        "q5_0",
+        "q6_k",
+        "q8_0",
+        "bf16",
+        "gguf",
+    ]
+    lowered = [(c, c.lower()) for c in candidates]
+    for token in preferred_order:
+        for name, lname in lowered:
+            if token in lname and lname.endswith(".gguf"):
+                return name
+    return candidates[0]
+
+
+def _resolve_gguf_pipeline_class(model_path: str) -> str:
+    """Determine which diffusion pipeline should serve a GGUF single file."""
+    arch = get_gguf_architecture(model_path)
+    # Reuse existing pipelines; GGUF is handled by the component loader.
+    return resolve_gguf_diffusion_pipeline_class_name(arch, model_ref=model_path)
+
 
 def maybe_download_lora(
     model_name_or_path: str, local_dir: str | None = None, download: bool = True
@@ -234,9 +347,46 @@ def verify_model_config_and_directory(model_path: str) -> dict[str, Any]:
         The loaded model configuration as a dictionary
     """
 
+    # GGUF single-file diffusion checkpoints don't have a diffusers `model_index.json`.
+    if check_gguf_file(model_path):
+        arch = get_gguf_architecture(model_path)
+        pipeline_cls_name = resolve_gguf_diffusion_pipeline_class_name(
+            arch, model_ref=model_path
+        )
+        base_model_id = resolve_gguf_diffusion_base_model_id(arch, model_ref=model_path)
+        return {
+            "_class_name": pipeline_cls_name,
+            "_diffusers_version": "0.0.0",
+            "pipeline_name": pipeline_cls_name,
+            "gguf_file": str(model_path),
+            "gguf_architecture": arch,
+            "gguf_base_model_id": base_model_id,
+        }
+
     # Check for model_index.json which is required for diffusers models
     config_path = os.path.join(model_path, "model_index.json")
     if not os.path.exists(config_path):
+        # Support local directories that contain a GGUF single-file checkpoint.
+        if os.path.isdir(model_path):
+            gguf_files = sorted([p.name for p in Path(model_path).glob("*.gguf")])
+            if gguf_files:
+                chosen = select_default_gguf_filename(gguf_files)
+                first = str(Path(model_path) / chosen)
+                arch = get_gguf_architecture(first)
+                pipeline_cls_name = resolve_gguf_diffusion_pipeline_class_name(
+                    arch, model_ref=first
+                )
+                base_model_id = resolve_gguf_diffusion_base_model_id(
+                    arch, model_ref=first
+                )
+                return {
+                    "_class_name": pipeline_cls_name,
+                    "_diffusers_version": "0.0.0",
+                    "pipeline_name": pipeline_cls_name,
+                    "gguf_files": gguf_files,
+                    "gguf_architecture": arch,
+                    "gguf_base_model_id": base_model_id,
+                }
         raise ValueError(
             f"Model directory {model_path} does not contain model_index.json. "
             "Only HuggingFace diffusers format is supported."
@@ -335,6 +485,44 @@ def maybe_download_model_index(model_name_or_path: str) -> dict[str, Any]:
             "model_index.json not found for %s. Assuming it is a single model and downloading it.",
             model_name_or_path,
         )
+
+        # If the repo contains GGUF file(s), route to the corresponding GGUF diffusion pipeline
+        # without downloading the full snapshot.
+        try:
+            from huggingface_hub import list_repo_files, model_info
+
+            info = model_info(model_name_or_path)
+            gguf_meta = getattr(info, "gguf", None) or {}
+            arch = str(gguf_meta.get("architecture", "")).strip().lower()
+
+            repo_files = list_repo_files(model_name_or_path)
+            gguf_files = sorted([f for f in repo_files if f.lower().endswith(".gguf")])
+            if gguf_files:
+                if not arch:
+                    # Heuristic fallback when the hub doesn't provide gguf.architecture.
+                    lowered = model_name_or_path.lower()
+                    if "qwen" in lowered and "image" in lowered:
+                        arch = "qwen_image"
+
+                pipeline_cls_name = resolve_gguf_diffusion_pipeline_class_name(
+                    arch, model_ref=model_name_or_path
+                )
+                base_model_id = resolve_gguf_diffusion_base_model_id(
+                    arch, model_ref=model_name_or_path
+                )
+
+                return {
+                    "_class_name": pipeline_cls_name,
+                    "_diffusers_version": "0.0.0",
+                    "pipeline_name": pipeline_cls_name,
+                    "gguf_files": gguf_files,
+                    "gguf_architecture": arch,
+                    "gguf_base_model_id": base_model_id,
+                }
+        except Exception:
+            # Fall back to downloading and trying config.json.
+            pass
+
         local_path = maybe_download_model(model_name_or_path)
         config_path = os.path.join(local_path, "config.json")
         if not os.path.exists(config_path):

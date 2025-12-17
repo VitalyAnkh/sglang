@@ -39,9 +39,12 @@ from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+    check_gguf_file,
     get_config,
     get_diffusers_component_config,
+    get_gguf_architecture,
     get_hf_config,
+    resolve_gguf_diffusion_base_model_id,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -268,6 +271,10 @@ class TextEncoderLoader(ComponentLoader):
 
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.text_encoder_cpu_offload
+        if model_config is None:
+            # Fallback/native loading path doesn't have a parsed ModelConfig.
+            # Respect the user/server default offload flag directly.
+            return should_offload
         fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
@@ -376,6 +383,19 @@ class TextEncoderLoader(ComponentLoader):
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
+        archs = getattr(diffusers_pretrained_config, "architectures", None) or []
+        if server_args.text_encoder_cpu_offload and any(
+            "qwen2_5_vl" in str(arch).lower() for arch in archs
+        ):
+            # Qwen-Image uses a very large Qwen2.5-VL text encoder. The sglang-optimized
+            # loader currently initializes the module on CUDA before any sharding/offload,
+            # which OOMs on 16GB GPUs. Fall back to the native transformers implementation
+            # and keep it on CPU when CPU offload is requested; the TextEncodingStage will
+            # move the produced embeddings to GPU for the diffusion transformer.
+            logger.info(
+                "Qwen2.5-VL text encoder detected; loading via transformers on CPU to avoid CUDA OOM."
+            )
+            return self.load_native(component_model_path, server_args, "transformers")
         model_config = get_diffusers_component_config(model_path=component_model_path)
         _clean_hf_config_inplace(model_config)
         logger.info("HF model config: %s", model_config)
@@ -472,6 +492,8 @@ class TextEncoderLoader(ComponentLoader):
 class ImageEncoderLoader(TextEncoderLoader):
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.image_encoder_cpu_offload
+        if model_config is None:
+            return should_offload
         fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
@@ -608,6 +630,9 @@ class TransformerLoader(ComponentLoader):
         self, component_model_path: str, server_args: ServerArgs, *args
     ):
         """Load the transformer based on the model path, and inference args."""
+        if check_gguf_file(component_model_path):
+            return self._load_transformer_gguf(component_model_path, server_args)
+
         config = get_diffusers_component_config(model_path=component_model_path)
         hf_config = deepcopy(config)
         cls_name = config.pop("_class_name")
@@ -693,6 +718,162 @@ class TransformerLoader(ComponentLoader):
         model = model.eval()
 
         return model
+
+    def _load_transformer_gguf(
+        self, gguf_file: str, server_args: ServerArgs
+    ) -> torch.nn.Module:
+        """Load a diffusion transformer from a GGUF single file.
+
+        Currently only supports Qwen-Image transformer checkpoints (architecture=qwen_image).
+        """
+        server_args.model_paths["transformer"] = gguf_file
+
+        arch = get_gguf_architecture(gguf_file)
+        base_model_id = resolve_gguf_diffusion_base_model_id(arch, model_ref=gguf_file)
+
+        def _resolve_compute_dtype() -> torch.dtype:
+            precision = getattr(server_args.pipeline_config, "dit_precision", "bf16")
+            dtype = PRECISION_TO_TYPE.get(str(precision), torch.bfloat16)
+            if (
+                dtype == torch.bfloat16
+                and torch.cuda.is_available()
+                and (not torch.cuda.is_bf16_supported())
+            ):
+                dtype = torch.float16
+            return dtype
+
+        compute_dtype = _resolve_compute_dtype()
+
+        try:
+            from accelerate import init_empty_weights  # type: ignore
+        except Exception as e:  # pragma: no cover
+            raise ImportError(
+                "GGUF diffusion loading requires `accelerate`. Install via `pip install accelerate`."
+            ) from e
+
+        from diffusers import QwenImageTransformer2DModel
+        from diffusers.models.model_loading_utils import (
+            load_gguf_checkpoint,
+            load_model_dict_into_meta,
+        )
+        from diffusers.quantizers.auto import DiffusersAutoQuantizer
+        from diffusers.quantizers.gguf.utils import _replace_with_gguf_linear
+        from diffusers.quantizers.quantization_config import GGUFQuantizationConfig
+
+        logger.info("Loading Qwen-Image transformer GGUF (arch=%s): %s", arch, gguf_file)
+        try:
+            state_dict = load_gguf_checkpoint(gguf_file)
+        except ModuleNotFoundError as e:  # pragma: no cover
+            if getattr(e, "name", None) == "gguf":
+                raise ImportError(
+                    "GGUF diffusion loading requires the `gguf` Python package."
+                ) from e
+            raise
+
+        config_dict = QwenImageTransformer2DModel.load_config(
+            base_model_id, subfolder="transformer"
+        )
+
+        with init_empty_weights():
+            transformer = QwenImageTransformer2DModel.from_config(config_dict)
+
+        expected_keys = set(transformer.state_dict().keys())
+
+        def _maybe_strip_state_dict_prefix(sd: dict[str, Any]) -> dict[str, Any]:
+            # Fast path: already aligned.
+            if sd and all(k in expected_keys for k in list(sd.keys())[:50]):
+                return sd
+
+            prefixes = ("transformer.", "model.transformer.", "model.")
+            best: tuple[int, dict[str, Any]] | None = None
+            for prefix in prefixes:
+                stripped = {
+                    k[len(prefix) :]: v for k, v in sd.items() if k.startswith(prefix)
+                }
+                if not stripped:
+                    continue
+                score = sum(1 for k in stripped.keys() if k in expected_keys)
+                if best is None or score > best[0]:
+                    best = (score, stripped)
+            if best is not None and best[0] > 0:
+                logger.info(
+                    "Aligned GGUF state_dict by stripping prefix; matched %s keys.",
+                    best[0],
+                )
+                return best[1]
+            return sd
+
+        state_dict = _maybe_strip_state_dict_prefix(state_dict)
+
+        # Replace Linear layers that have GGUFParameters in the checkpoint.
+        _replace_with_gguf_linear(transformer, compute_dtype, state_dict)
+
+        # Load all transformer weights to GPU when available. If the checkpoint doesn't
+        # fit into VRAM, users should pick a smaller quantization (e.g. Q3_K_M).
+        device_map = {"": "cuda"} if torch.cuda.is_available() else {"": "cpu"}
+
+        quant_cfg = GGUFQuantizationConfig(compute_dtype=compute_dtype)
+        hf_quantizer = DiffusersAutoQuantizer.from_config(quant_cfg, pre_quantized=True)
+        hf_quantizer.validate_environment(
+            torch_dtype=compute_dtype, from_flax=False, device_map=device_map
+        )
+
+        load_model_dict_into_meta(
+            transformer,
+            state_dict,
+            dtype=compute_dtype,
+            model_name_or_path=str(gguf_file),
+            hf_quantizer=hf_quantizer,
+            device_map=device_map,
+        )
+        del state_dict
+
+        transformer.eval()
+
+        class _QwenImageDiffusersTransformerWrapper(nn.Module):
+            def __init__(self, inner: QwenImageTransformer2DModel):
+                super().__init__()
+                self.inner = inner
+
+            def forward(
+                self,
+                hidden_states: torch.Tensor,
+                encoder_hidden_states: torch.Tensor | list[torch.Tensor] | None = None,
+                encoder_hidden_states_mask: torch.Tensor
+                | list[torch.Tensor]
+                | None = None,
+                timestep: torch.Tensor | None = None,
+                img_shapes=None,
+                txt_seq_lens=None,
+                guidance: torch.Tensor | None = None,
+                attention_kwargs=None,
+                freqs_cis=None,  # ignored (sglang-only optimized path)
+                **kwargs,
+            ) -> torch.Tensor:
+                del kwargs, freqs_cis
+
+                if isinstance(encoder_hidden_states, list):
+                    encoder_hidden_states = encoder_hidden_states[0]
+                if isinstance(encoder_hidden_states_mask, list):
+                    encoder_hidden_states_mask = encoder_hidden_states_mask[0]
+
+                if timestep is not None:
+                    timestep = timestep.to(dtype=hidden_states.dtype) / 1000.0
+
+                out = self.inner(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    timestep=timestep,
+                    img_shapes=img_shapes,
+                    txt_seq_lens=txt_seq_lens,
+                    guidance=guidance,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )
+                return out[0]
+
+        return _QwenImageDiffusersTransformerWrapper(transformer)
 
 
 class SchedulerLoader(ComponentLoader):

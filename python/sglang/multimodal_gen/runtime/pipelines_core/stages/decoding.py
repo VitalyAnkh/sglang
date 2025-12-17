@@ -116,13 +116,23 @@ class DecodingStage(PipelineStage):
             Decoded video tensor with shape (batch, channels, frames, height, width),
             normalized to [0, 1] range and moved to CPU as float32
         """
-        self.vae = self.vae.to(get_local_torch_device())
-        latents = latents.to(get_local_torch_device())
+        decode_device = get_local_torch_device()
+        if server_args.vae_cpu_offload:
+            # When VAE CPU offload is requested, run VAE decoding on CPU for Qwen-Image
+            # to avoid CUDA OOM on 16GB cards.
+            cfg_name = server_args.pipeline_config.__class__.__name__
+            if cfg_name in ("QwenImagePipelineConfig", "QwenImageEditPipelineConfig"):
+                decode_device = torch.device("cpu")
+
+        self.vae = self.vae.to(decode_device)
+        latents = latents.to(decode_device)
         # Setup VAE precision
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         vae_autocast_enabled = (
-            vae_dtype != torch.float32
-        ) and not server_args.disable_autocast
+            decode_device.type == "cuda"
+            and (vae_dtype != torch.float32)
+            and (not server_args.disable_autocast)
+        )
 
         # scale and shift
         latents = self.scale_and_shift(latents, server_args)
@@ -132,8 +142,9 @@ class DecodingStage(PipelineStage):
         )
 
         # Decode latents
+        device_type = "cuda" if decode_device.type == "cuda" else "cpu"
         with torch.autocast(
-            device_type="cuda", dtype=vae_dtype, enabled=vae_autocast_enabled
+            device_type=device_type, dtype=vae_dtype, enabled=vae_autocast_enabled
         ):
             try:
                 # TODO: make it more specific

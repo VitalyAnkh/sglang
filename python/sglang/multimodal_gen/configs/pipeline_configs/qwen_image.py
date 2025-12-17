@@ -178,7 +178,26 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
                 )
             ]
         ] * batch_size
-        txt_seq_lens = [prompt_embeds[0].shape[1]]
+        max_txt_seq_len = int(prompt_embeds[0].shape[1])
+        txt_seq_lens = [max_txt_seq_len] * batch_size
+
+        # Some transformer implementations (e.g. diffusers) require an explicit mask.
+        # We use an all-ones mask here because prompt embeddings are already padded.
+        encoder_hidden_states_mask = torch.ones(
+            (batch_size, max_txt_seq_len), device=device, dtype=torch.long
+        )
+
+        cond_kwargs: dict[str, object] = {
+            "img_shapes": img_shapes,
+            "txt_seq_lens": txt_seq_lens,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
+        }
+
+        # If the transformer exposes a rotary embedding module, compute and pass precomputed
+        # RoPE frequencies (sglang-optimized transformer path). Otherwise, pass only the
+        # higher-level shape metadata (diffusers path).
+        if rotary_emb is None:
+            return cond_kwargs
 
         (img_cos, img_sin), (txt_cos, txt_sin) = self.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype
@@ -186,10 +205,8 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
 
         img_cos = shard_rotary_emb_for_sp(img_cos)
         img_sin = shard_rotary_emb_for_sp(img_sin)
-        return {
-            "txt_seq_lens": txt_seq_lens,
-            "freqs_cis": ((img_cos, img_sin), (txt_cos, txt_sin)),
-        }
+        cond_kwargs["freqs_cis"] = ((img_cos, img_sin), (txt_cos, txt_sin))
+        return cond_kwargs
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return self._prepare_cond_kwargs(

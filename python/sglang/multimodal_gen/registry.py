@@ -44,6 +44,9 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     HunyuanSamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImageSamplingParams
+from sglang.multimodal_gen.configs.sample.qwen_image_gguf import (
+    QwenImageGGUFSamplingParams,
+)
 from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
@@ -90,7 +93,15 @@ def _discover_and_register_pipelines():
         package.__path__, package.__name__ + "."
     ):
         if not ispkg:
-            pipeline_module = importlib.import_module(module_name)
+            try:
+                pipeline_module = importlib.import_module(module_name)
+            except (ImportError, OSError) as e:
+                logger.warning(
+                    "Skipping pipeline module '%s' due to import error: %s",
+                    module_name,
+                    e,
+                )
+                continue
             if hasattr(pipeline_module, "EntryClass"):
                 entry_cls = pipeline_module.EntryClass
                 entry_cls_list = (
@@ -289,6 +300,24 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
 
 # Registration of model configs
 def _register_configs():
+    # Qwen-Image GGUF (single-file transformer checkpoints, e.g. city96/Qwen-Image-gguf)
+    register_configs(
+        sampling_param_cls=QwenImageGGUFSamplingParams,
+        pipeline_config_cls=QwenImagePipelineConfig,
+        hf_model_paths=[
+            "city96/Qwen-Image-gguf",
+            "wikeeyang/Real-Qwen-Image-v1.0",
+        ],
+        model_detectors=[
+            lambda hf_id: ("gguf" in hf_id.lower())
+            and (
+                "real-qwen-image" in hf_id.lower()
+                or "qwen-image" in hf_id.lower()
+                or "qwen_image" in hf_id.lower()
+            ),
+        ],
+    )
+
     # Hunyuan
     register_configs(
         sampling_param_cls=HunyuanSamplingParams,
