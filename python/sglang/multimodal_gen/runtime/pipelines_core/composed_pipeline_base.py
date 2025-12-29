@@ -7,7 +7,6 @@ Base class for composed pipelines.
 This module defines the base class for pipelines that are composed of multiple stages.
 """
 
-import argparse
 import os
 from abc import ABC, abstractmethod
 from typing import Any, cast
@@ -15,14 +14,13 @@ from typing import Any, cast
 import torch
 from tqdm import tqdm
 
-from sglang.multimodal_gen.configs.pipeline_configs import PipelineConfig
 from sglang.multimodal_gen.runtime.loader.component_loader import (
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
@@ -51,7 +49,6 @@ class ComposedPipelineBase(ABC):
     _extra_config_module_map: dict[str, str] = {}
     server_args: ServerArgs | None = None
     modules: dict[str, Any] = {}
-    post_init_called: bool = False
     executor: PipelineExecutor | None = None
 
     # the name of the pipeline it associated with, in diffusers
@@ -87,14 +84,14 @@ class ComposedPipelineBase(ABC):
 
         if self._required_config_modules is None:
             raise NotImplementedError("Subclass must set _required_config_modules")
-        # temp disable for duplicate initialing tp
-        # maybe_init_distributed_environment_and_model_parallel(
-        #     server_args.tp_size, server_args.sp_size
-        # )
 
+        # [module_name, gpu memory usage]
+        self.memory_usages: dict[str, float] = {}
         # Load modules directly in initialization
         logger.info("Loading pipeline modules...")
         self.modules = self.load_modules(server_args, loaded_modules)
+
+        self.__post_init__()
 
     def build_executor(self, server_args: ServerArgs):
         # TODO
@@ -105,47 +102,12 @@ class ComposedPipelineBase(ABC):
         # return SyncExecutor(server_args=server_args)
         return ParallelExecutor(server_args=server_args)
 
-    def post_init(self) -> None:
+    def __post_init__(self) -> None:
         assert self.server_args is not None, "server_args must be set"
-        if self.post_init_called:
-            return
-        self.post_init_called = True
-
         self.initialize_pipeline(self.server_args)
 
         logger.info("Creating pipeline stages...")
         self.create_pipeline_stages(self.server_args)
-
-    @classmethod
-    def from_pretrained(
-        cls,
-        model_path: str,
-        device: str | None = None,
-        torch_dtype: torch.dtype | None = None,
-        pipeline_config: str | PipelineConfig | None = None,
-        args: argparse.Namespace | None = None,
-        required_config_modules: list[str] | None = None,
-        loaded_modules: dict[str, torch.nn.Module] | None = None,
-        **kwargs,
-    ) -> "ComposedPipelineBase":
-        """
-        Load a pipeline from a pretrained model.
-        loaded_modules: Optional[Dict[str, torch.nn.Module]] = None,
-        If provided, loaded_modules will be used instead of loading from config/pretrained weights.
-        """
-        kwargs["model_path"] = model_path
-        server_args = ServerArgs.from_kwargs(**kwargs)
-
-        logger.info("server_args in from_pretrained: %s", server_args)
-
-        pipe = cls(
-            model_path,
-            server_args,
-            required_config_modules=required_config_modules,
-            loaded_modules=loaded_modules,
-        )
-        pipe.post_init()
-        return pipe
 
     def get_module(self, module_name: str, default_value: Any = None) -> Any:
         if module_name not in self.modules:
@@ -226,9 +188,12 @@ class ComposedPipelineBase(ABC):
         model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
 
+        gguf_transformer_file: str | None = None
+        component_root_path = self.model_path
+
         # GGUF single-file diffusion checkpoints (e.g. Qwen-Image GGUF) don't ship a diffusers
-        # `model_index.json`. For these models we synthesize the module list from the base model
-        # and load the transformer weights from the GGUF file.
+        # `model_index.json`. For these models we load all non-transformer components from a base
+        # diffusers repo and load the transformer weights from the GGUF file.
         if "gguf_file" in model_index or "gguf_files" in model_index:
             base_model_id = cast(str | None, model_index.get("gguf_base_model_id"))
             if not base_model_id:
@@ -237,33 +202,34 @@ class ComposedPipelineBase(ABC):
                 )
 
             if "gguf_file" in model_index:
-                gguf_file = str(model_index["gguf_file"])
+                gguf_transformer_file = str(model_index["gguf_file"])
             else:
                 gguf_files = list(cast(list[str], model_index.get("gguf_files", [])))
                 chosen = select_default_gguf_filename(sorted(gguf_files))
                 if os.path.exists(self.model_path):
-                    gguf_file = os.path.join(self.model_path, chosen)
+                    gguf_transformer_file = os.path.join(self.model_path, chosen)
                 else:
                     from huggingface_hub import hf_hub_download
 
                     try:
-                        gguf_file = hf_hub_download(
+                        gguf_transformer_file = hf_hub_download(
                             repo_id=self.model_path,
                             filename=chosen,
                             revision=server_args.revision,
                             local_files_only=True,
                         )
                     except Exception:
-                        gguf_file = hf_hub_download(
+                        gguf_transformer_file = hf_hub_download(
                             repo_id=self.model_path,
                             filename=chosen,
                             revision=server_args.revision,
                         )
 
+            assert gguf_transformer_file is not None
             logger.info(
                 "GGUF diffusion checkpoint detected; loading base components from '%s' and transformer from '%s'.",
                 base_model_id,
-                gguf_file,
+                gguf_transformer_file,
             )
 
             allow_patterns = ["model_index.json"]
@@ -277,8 +243,9 @@ class ComposedPipelineBase(ABC):
                 else:
                     allow_patterns.append(f"{load_module_name}/*")
 
+            from huggingface_hub import snapshot_download
+
             try:
-                from huggingface_hub import snapshot_download
                 base_model_path = snapshot_download(
                     repo_id=base_model_id,
                     revision=server_args.revision,
@@ -288,75 +255,15 @@ class ComposedPipelineBase(ABC):
                 )
             except Exception:
                 # Download only required modules (avoid base transformer weights).
-                from huggingface_hub import snapshot_download
-
                 base_model_path = snapshot_download(
                     repo_id=base_model_id,
                     revision=server_args.revision,
                     allow_patterns=allow_patterns,
                     ignore_patterns=["*.onnx", "*.msgpack"],
                 )
-            base_index = verify_model_config_and_directory(base_model_path)
 
-            base_index.pop("_class_name", None)
-            base_index.pop("_diffusers_version", None)
-            base_index.pop("pipeline_name", None)
-
-            model_index = {
-                required_module: base_index[required_module]
-                for required_module in self.required_config_modules
-            }
-
-            required_modules = self.required_config_modules
-            logger.info("Loading required components: %s", required_modules)
-
-            components: dict[str, Any] = {}
-            for module_name, (
-                transformers_or_diffusers,
-                _architecture,
-            ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
-                if loaded_modules is not None and module_name in loaded_modules:
-                    logger.info("Using module %s already provided", module_name)
-                    components[module_name] = loaded_modules[module_name]
-                    continue
-
-                if module_name in self._extra_config_module_map:
-                    load_module_name = self._extra_config_module_map[module_name]
-                else:
-                    load_module_name = module_name
-
-                if module_name == "transformer":
-                    component_model_path = gguf_file
-                elif module_name == "vae" and server_args.vae_path is not None:
-                    component_model_path = server_args.vae_path
-                    if not os.path.exists(component_model_path):
-                        component_model_path = maybe_download_model(component_model_path)
-                    logger.info(
-                        "Using custom VAE path: %s instead of default path: %s",
-                        component_model_path,
-                        os.path.join(base_model_path, load_module_name),
-                    )
-                else:
-                    component_model_path = os.path.join(base_model_path, load_module_name)
-
-                module = PipelineComponentLoader.load_module(
-                    module_name=load_module_name,
-                    component_model_path=component_model_path,
-                    transformers_or_diffusers=transformers_or_diffusers,
-                    server_args=server_args,
-                )
-
-                if module_name in components:
-                    logger.warning("Overwriting module %s", module_name)
-                components[module_name] = module
-
-            for module_name in required_modules:
-                if module_name not in components or components[module_name] is None:
-                    raise ValueError(
-                        f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
-                    )
-
-            return components
+            component_root_path = base_model_path
+            model_index = verify_model_config_and_directory(component_root_path)
 
         # remove keys that are not pipeline modules
         model_index.pop("_class_name")
@@ -454,16 +361,20 @@ class ComposedPipelineBase(ABC):
                 logger.info(
                     "Using custom VAE path: %s instead of default path: %s",
                     component_model_path,
-                    os.path.join(self.model_path, load_module_name),
+                    os.path.join(component_root_path, load_module_name),
                 )
+            elif load_module_name == "transformer" and gguf_transformer_file is not None:
+                component_model_path = gguf_transformer_file
             else:
-                component_model_path = os.path.join(self.model_path, load_module_name)
-            module = PipelineComponentLoader.load_module(
+                component_model_path = os.path.join(component_root_path, load_module_name)
+            module, memory_usage = PipelineComponentLoader.load_module(
                 module_name=load_module_name,
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
             )
+
+            self.memory_usages[load_module_name] = memory_usage
 
             if module_name in components:
                 logger.warning("Overwriting module %s", module_name)
@@ -475,6 +386,8 @@ class ComposedPipelineBase(ABC):
                 raise ValueError(
                     f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
                 )
+
+        logger.debug("Memory usage of loaded modules: %s", self.memory_usages)
 
         return components
 
@@ -490,7 +403,7 @@ class ComposedPipelineBase(ABC):
         self,
         batch: Req,
         server_args: ServerArgs,
-    ) -> Req:
+    ) -> OutputBatch:
         """
         Generate a video or image using the pipeline.
 
@@ -500,13 +413,13 @@ class ComposedPipelineBase(ABC):
         Returns:
             Req: The batch with the generated video or image.
         """
-        if not self.post_init_called:
-            self.post_init()
 
         if self.is_lora_set() and not self.is_lora_effective():
             logger.warning(
                 "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
             )
+
+        batch.log(server_args=server_args)
 
         # Execute each stage
         logger.info(
@@ -514,4 +427,5 @@ class ComposedPipelineBase(ABC):
             list(self._stage_name_mapping.keys()),
             main_process_only=True,
         )
-        return self.executor.execute(self.stages, batch, server_args)
+
+        return self.executor.execute_with_profiling(self.stages, batch, server_args)

@@ -7,7 +7,6 @@ import glob
 import importlib.util
 import json
 import os
-import time
 import traceback
 from abc import ABC
 from collections.abc import Generator, Iterable
@@ -17,6 +16,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from diffusers import AutoModel
 from safetensors.torch import load_file as safetensors_load_file
 from torch.distributed import init_device_mesh
 from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
@@ -45,6 +45,9 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     get_gguf_architecture,
     get_hf_config,
     resolve_gguf_diffusion_base_model_id,
+)
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
+    LayerwiseOffloadManager,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
@@ -90,15 +93,37 @@ def _list_safetensors_files(model_path: str) -> list[str]:
     return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
 
 
+def get_memory_usage_of_component(module) -> float | None:
+    """
+    returned value is in GB, rounded to 2 decimal digits
+    """
+    if not isinstance(module, nn.Module):
+        return None
+    BYTES_PER_GB = 1024**3
+    if hasattr(module, "get_memory_footprint"):
+        usage = module.get_memory_footprint() / BYTES_PER_GB
+    else:
+        # manually
+        param_size = sum(p.numel() * p.element_size() for p in module.parameters())
+        buffer_size = sum(b.numel() * b.element_size() for b in module.buffers())
+
+        total_size_bytes = param_size + buffer_size
+        usage = total_size_bytes / (1024**3)
+
+    return round(usage, 2)
+
+
 class ComponentLoader(ABC):
     """Base class for loading a specific type of model component."""
 
     def __init__(self, device=None) -> None:
         self.device = device
 
-    def should_offload(self, server_args, model_config: ModelConfig | None = None):
-        # offload by default
-        return True
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        # not offload by default
+        return False
 
     def target_device(self, should_offload):
         if should_offload:
@@ -116,7 +141,7 @@ class ComponentLoader(ABC):
         server_args: ServerArgs,
         module_name: str,
         transformers_or_diffusers: str,
-    ):
+    ) -> tuple[AutoModel, float]:
         """
         Template method that standardizes logging around the core load implementation.
         The priority of loading method is:
@@ -125,7 +150,13 @@ class ComponentLoader(ABC):
         If all of the above methods failed, an error will be thrown
 
         """
-        logger.info("Loading %s from %s", module_name, component_model_path)
+        gpu_mem_before_loading = current_platform.get_available_gpu_memory()
+        logger.info(
+            "Loading %s from %s. avail mem: %.2f GB",
+            module_name,
+            component_model_path,
+            gpu_mem_before_loading,
+        )
         try:
             component = self.load_customized(
                 component_model_path, server_args, module_name
@@ -157,20 +188,27 @@ class ComponentLoader(ABC):
 
         if component is None:
             logger.warning("Loaded %s returned None", module_name)
+            consumed = 0.0
         else:
+            current_gpu_mem = current_platform.get_available_gpu_memory()
+            consumed = get_memory_usage_of_component(component)
+            if consumed is None or consumed == 0.0:
+                consumed = gpu_mem_before_loading - current_gpu_mem
             logger.info(
-                f"Loaded %s: %s from: {source}",
+                f"Loaded %s: %s from {source}. avail mem: %.2f GB, %.2f GB consumed",
                 module_name,
                 component.__class__.__name__,
+                current_gpu_mem,
+                consumed,
             )
-        return component
+        return component, consumed
 
     def load_native(
         self,
         component_model_path: str,
         server_args: ServerArgs,
         transformers_or_diffusers: str,
-    ):
+    ) -> AutoModel:
         """
         Load the component using the native library (transformers/diffusers).
         """
@@ -271,16 +309,17 @@ class TextEncoderLoader(ComponentLoader):
         allow_patterns_overrides: list[str] | None = None
         """If defined, weights will load exclusively using these patterns."""
 
-    counter_before_loading_weights: float = 0.0
-    counter_after_loading_weights: float = 0.0
-
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.text_encoder_cpu_offload
-        if model_config is None:
-            # Fallback/native loading path doesn't have a parsed ModelConfig.
-            # Respect the user/server default offload flag directly.
-            return should_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -349,8 +388,6 @@ class TextEncoderLoader(ComponentLoader):
         else:
             weights_iterator = pt_weights_iterator(hf_weights_files, to_cpu=to_cpu)
 
-        if self.counter_before_loading_weights == 0.0:
-            self.counter_before_loading_weights = time.perf_counter()
         # apply the prefix.
         return ((source.prefix + name, tensor) for (name, tensor) in weights_iterator)
 
@@ -450,12 +487,6 @@ class TextEncoderLoader(ComponentLoader):
             loaded_weights = model.load_weights(
                 self._get_all_weights(model, model_path, to_cpu=should_offload)
             )
-            self.counter_after_loading_weights = time.perf_counter()
-            logger.info(
-                "Loading weights took %.2f seconds",
-                self.counter_after_loading_weights
-                - self.counter_before_loading_weights,
-            )
 
             # Explicitly move model to target device after loading weights
             model = model.to(local_torch_device)
@@ -497,9 +528,15 @@ class TextEncoderLoader(ComponentLoader):
 class ImageEncoderLoader(TextEncoderLoader):
     def should_offload(self, server_args, model_config: ModelConfig | None = None):
         should_offload = server_args.image_encoder_cpu_offload
-        if model_config is None:
-            return should_offload
-        fsdp_shard_conditions = getattr(model_config, "_fsdp_shard_conditions", [])
+        if not should_offload:
+            return False
+        # _fsdp_shard_conditions is in arch_config, not directly on model_config
+        arch_config = (
+            getattr(model_config, "arch_config", model_config) if model_config else None
+        )
+        fsdp_shard_conditions = (
+            getattr(arch_config, "_fsdp_shard_conditions", []) if arch_config else []
+        )
         use_cpu_offload = should_offload and len(fsdp_shard_conditions) > 0
         return use_cpu_offload
 
@@ -565,8 +602,10 @@ class TokenizerLoader(ComponentLoader):
 class VAELoader(ComponentLoader):
     """Loader for VAE."""
 
-    def should_offload(self, server_args, cpu_offload_flag, model_config):
-        return True
+    def should_offload(
+        self, server_args: ServerArgs, model_config: ModelConfig | None = None
+    ):
+        return server_args.vae_cpu_offload
 
     def load_customized(
         self, component_model_path: str, server_args: ServerArgs, *args
@@ -587,7 +626,8 @@ class VAELoader(ComponentLoader):
         # NOTE: some post init logics are only available after updated with config
         vae_config.post_init()
 
-        target_device = self.target_device(server_args.vae_cpu_offload)
+        should_offload = self.should_offload(server_args)
+        target_device = self.target_device(should_offload)
 
         # Check for auto_map first (custom VAE classes)
         auto_map = config.get("auto_map", {})
@@ -646,10 +686,6 @@ class TransformerLoader(ComponentLoader):
                 "Model config does not contain a _class_name attribute. "
                 "Only diffusers format is supported."
             )
-
-        if server_args.override_transformer_cls_name is not None:
-            cls_name = server_args.override_transformer_cls_name
-            logger.info("Overriding transformer cls_name to %s", cls_name)
 
         server_args.model_paths["transformer"] = component_model_path
 
@@ -721,6 +757,24 @@ class TransformerLoader(ComponentLoader):
         ), "Model dtype does not match default dtype"
 
         model = model.eval()
+
+        if server_args.dit_layerwise_offload and hasattr(model, "dit_module_names"):
+            # TODO(will): support multiple module names
+            module_name = getattr(model, "dit_module_names", ["transformer_blocks"])[0]
+            try:
+                num_layers = len(getattr(model, module_name))
+            except Exception:
+                num_layers = None
+            if isinstance(num_layers, int) and num_layers > 0:
+                mgr = LayerwiseOffloadManager(
+                    model,
+                    module_list_attr=module_name,
+                    num_layers=num_layers,
+                    enabled=True,
+                    pin_cpu_memory=server_args.pin_cpu_memory,
+                    auto_initialize=True,
+                )
+                setattr(model, "_layerwise_offload_manager", mgr)
 
         return model
 
@@ -813,9 +867,30 @@ class TransformerLoader(ComponentLoader):
         # Replace Linear layers that have GGUFParameters in the checkpoint.
         _replace_with_gguf_linear(transformer, compute_dtype, state_dict)
 
-        # Load all transformer weights to GPU when available. If the checkpoint doesn't
-        # fit into VRAM, users should pick a smaller quantization (e.g. Q3_K_M).
-        device_map = {"": "cuda"} if torch.cuda.is_available() else {"": "cpu"}
+        # Honor existing DiT offload flags when loading GGUF diffusion transformers.
+        # - When offload is requested, load weights on CPU first to avoid CUDA OOM during load,
+        #   then enable layerwise CPU offload for transformer blocks at runtime.
+        # - When offload is not requested, load weights directly on GPU for best performance.
+        if server_args.use_fsdp_inference:
+            logger.warning(
+                "use_fsdp_inference is not supported for GGUF diffusion transformers; ignoring."
+            )
+
+        want_layerwise_offload = bool(
+            server_args.dit_layerwise_offload or server_args.dit_cpu_offload
+        )
+        if want_layerwise_offload and server_args.dit_cpu_offload and not (
+            server_args.dit_layerwise_offload
+        ):
+            logger.info(
+                "dit_cpu_offload is enabled for a GGUF diffusion transformer; using layerwise offload (dit_layerwise_offload) instead."
+            )
+
+        device_map = (
+            {"": "cpu"}
+            if want_layerwise_offload
+            else ({"": "cuda"} if torch.cuda.is_available() else {"": "cpu"})
+        )
 
         quant_cfg = GGUFQuantizationConfig(compute_dtype=compute_dtype)
         hf_quantizer = DiffusersAutoQuantizer.from_config(quant_cfg, pre_quantized=True)
@@ -878,7 +953,65 @@ class TransformerLoader(ComponentLoader):
                 )
                 return out[0]
 
-        return _QwenImageDiffusersTransformerWrapper(transformer)
+        wrapper = _QwenImageDiffusersTransformerWrapper(transformer)
+
+        if want_layerwise_offload and torch.cuda.is_available():
+            # Keep small non-block modules on GPU for performance and device compatibility.
+            target_device = torch.device("cuda", torch.cuda.current_device())
+
+            for name, param in transformer.named_parameters():
+                if name.startswith("transformer_blocks."):
+                    continue
+                if param.device != target_device:
+                    param.data = param.data.to(device=target_device, non_blocking=True)
+
+            for name, buf in transformer.named_buffers():
+                if name.startswith("transformer_blocks."):
+                    continue
+                if buf is None:
+                    continue
+                if buf.device != target_device:
+                    buf.data = buf.data.to(device=target_device, non_blocking=True)
+
+            num_layers = len(transformer.transformer_blocks)
+            offload_mgr = LayerwiseOffloadManager(
+                wrapper,
+                module_list_attr="transformer_blocks",
+                num_layers=num_layers,
+                enabled=True,
+                pin_cpu_memory=server_args.pin_cpu_memory,
+                auto_initialize=False,
+            )
+            offload_mgr.initialize()
+
+            # Attach hooks so we can prefetch/release per layer without rewriting the
+            # diffusers forward implementation.
+            def _make_pre_hook(layer_idx: int):
+                def _pre_hook(_module, _inputs):
+                    if not getattr(offload_mgr, "enabled", False):
+                        return
+                    offload_mgr.prefetch_layer(layer_idx + 1, non_blocking=True)
+
+                return _pre_hook
+
+            def _make_post_hook(layer_idx: int):
+                def _post_hook(_module, _inputs, _output):
+                    if getattr(offload_mgr, "enabled", False) and offload_mgr.copy_stream is not None:
+                        # Ensure any async H2D copies for the next layer are complete
+                        # before progressing to the next transformer block.
+                        torch.cuda.current_stream().wait_stream(offload_mgr.copy_stream)
+                    offload_mgr.release_layer(layer_idx)
+                    return _output
+
+                return _post_hook
+
+            for i, block in enumerate(transformer.transformer_blocks):
+                block.register_forward_pre_hook(_make_pre_hook(i))
+                block.register_forward_hook(_make_post_hook(i))
+
+            setattr(wrapper, "_layerwise_offload_manager", offload_mgr)
+
+        return wrapper
 
 
 class SchedulerLoader(ComponentLoader):
@@ -900,8 +1033,7 @@ class SchedulerLoader(ComponentLoader):
         scheduler = scheduler_cls(**config)
         if server_args.pipeline_config.flow_shift is not None:
             scheduler.set_shift(server_args.pipeline_config.flow_shift)
-        if server_args.pipeline_config.timesteps_scale is not None:
-            scheduler.set_timesteps_scale(server_args.pipeline_config.timesteps_scale)
+
         return scheduler
 
 

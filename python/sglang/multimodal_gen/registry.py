@@ -18,7 +18,6 @@ from sglang.multimodal_gen.configs.pipeline_configs import (
     FastHunyuanConfig,
     FluxPipelineConfig,
     HunyuanConfig,
-    StepVideoT2VConfig,
     WanI2V480PConfig,
     WanI2V720PConfig,
     WanT2V480PConfig,
@@ -30,6 +29,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineCon
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImageEditPipelineConfig,
     QwenImageEditPlusPipelineConfig,
+    QwenImageLayeredPipelineConfig,
     QwenImagePipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
@@ -44,14 +44,11 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
     FastHunyuanSamplingParam,
     HunyuanSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.qwen_image_gguf import (
-    QwenImageGGUFSamplingParams,
-)
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageEditPlusSamplingParams,
+    QwenImageLayeredSamplingParams,
     QwenImageSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.stepvideo import StepVideoT2VSamplingParams
 from sglang.multimodal_gen.configs.sample.wan import (
     FastWanT2V480PConfig,
     Wan2_1_Fun_1_3B_InP_SamplingParams,
@@ -97,15 +94,7 @@ def _discover_and_register_pipelines():
         package.__path__, package.__name__ + "."
     ):
         if not ispkg:
-            try:
-                pipeline_module = importlib.import_module(module_name)
-            except (ImportError, OSError) as e:
-                logger.warning(
-                    "Skipping pipeline module '%s' due to import error: %s",
-                    module_name,
-                    e,
-                )
-                continue
+            pipeline_module = importlib.import_module(module_name)
             if hasattr(pipeline_module, "EntryClass"):
                 entry_cls = pipeline_module.EntryClass
                 entry_cls_list = (
@@ -304,24 +293,6 @@ def get_model_info(model_path: str) -> Optional[ModelInfo]:
 
 # Registration of model configs
 def _register_configs():
-    # Qwen-Image GGUF (single-file transformer checkpoints, e.g. city96/Qwen-Image-gguf)
-    register_configs(
-        sampling_param_cls=QwenImageGGUFSamplingParams,
-        pipeline_config_cls=QwenImagePipelineConfig,
-        hf_model_paths=[
-            "city96/Qwen-Image-gguf",
-            "wikeeyang/Real-Qwen-Image-v1.0",
-        ],
-        model_detectors=[
-            lambda hf_id: ("gguf" in hf_id.lower())
-            and (
-                "real-qwen-image" in hf_id.lower()
-                or "qwen-image" in hf_id.lower()
-                or "qwen_image" in hf_id.lower()
-            ),
-        ],
-    )
-
     # Hunyuan
     register_configs(
         sampling_param_cls=HunyuanSamplingParams,
@@ -337,16 +308,6 @@ def _register_configs():
         hf_model_paths=[
             "FastVideo/FastHunyuan-diffusers",
         ],
-    )
-
-    # StepVideo
-    register_configs(
-        sampling_param_cls=StepVideoT2VSamplingParams,
-        pipeline_config_cls=StepVideoT2VConfig,
-        hf_model_paths=[
-            "FastVideo/stepvideo-t2v-diffusers",
-        ],
-        model_detectors=[lambda hf_id: "stepvideo" in hf_id.lower()],
     )
 
     # Wan
@@ -453,6 +414,9 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+        # Also covers Qwen-Image GGUF checkpoints which synthesize `_class_name=QwenImagePipeline`
+        # (e.g. city96/Qwen-Image-gguf and fine-tuned variants).
+        model_detectors=[lambda s: "qwenimagepipeline" in s.lower()],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
@@ -464,6 +428,18 @@ def _register_configs():
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlusPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageEditPlusSamplingParams,
+        pipeline_config_cls=QwenImageEditPlusPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
+    )
+
+    register_configs(
+        sampling_param_cls=QwenImageLayeredSamplingParams,
+        pipeline_config_cls=QwenImageLayeredPipelineConfig,
+        hf_model_paths=["Qwen/Qwen-Image-Layered"],
     )
 
 

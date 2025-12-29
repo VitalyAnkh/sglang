@@ -226,7 +226,7 @@ class TextEncodingStage(PipelineStage):
                 f"Invalid return_type '{return_type}'. Expected one of: 'list', 'dict', 'stack'"
             )
 
-        local_device = get_local_torch_device()
+        target_device = device if device is not None else get_local_torch_device()
 
         for i in indices:
             tokenizer = self.tokenizers[i]
@@ -251,11 +251,10 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
-            compute_device = device if device is not None else local_device
+            compute_device = target_device
             if device is None:
-                # Native transformers models may be kept on CPU (e.g. large Qwen2.5-VL text encoder
-                # for Qwen-Image). In that case, run the text encoder on CPU but move the produced
-                # embeddings/masks back to the local device for the diffusion transformer.
+                # Some large text encoders (e.g. Qwen2.5-VL) may be intentionally kept
+                # on CPU when CPU offload is requested to avoid CUDA OOM at load time.
                 dev = getattr(text_encoder, "device", None)
                 if isinstance(dev, torch.device) and dev.type == "cpu":
                     compute_device = torch.device("cpu")
@@ -284,18 +283,18 @@ class TextEncodingStage(PipelineStage):
             prompt_embeds = postprocess_func(outputs, text_inputs)
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(dtype=dtype)
-            if prompt_embeds.device != local_device:
-                prompt_embeds = prompt_embeds.to(local_device)
+            if prompt_embeds.device != target_device:
+                prompt_embeds = prompt_embeds.to(target_device)
 
             embeds_list.append(prompt_embeds)
             if is_flux_v1:
                 pooled = outputs.pooler_output
-                if hasattr(pooled, "device") and pooled.device != local_device:
-                    pooled = pooled.to(local_device)
+                if hasattr(pooled, "device") and pooled.device != target_device:
+                    pooled = pooled.to(target_device)
                 pooled_embeds_list.append(pooled)
             if return_attention_mask:
-                if attention_mask.device != local_device:
-                    attention_mask = attention_mask.to(local_device)
+                if attention_mask.device != target_device:
+                    attention_mask = attention_mask.to(target_device)
                 attn_masks_list.append(attention_mask)
 
         # Shape results according to return_type
