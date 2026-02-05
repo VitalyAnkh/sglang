@@ -225,6 +225,13 @@ class DecodingStage(PipelineStage):
             trajectory_decoded = None
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        # OutputBatch goes over ZMQ/pickle (cross-process). If `frames` is a non-CPU
+        # tensor (e.g., CUDA/ROCm), unpickling may allocate device storage again and OOM:
+        #   frames(device) -> pickle -> bytes -> unpickle -> frames(device)
+        # Keeping it on CPU avoids the extra device allocation:
+        #   frames(cpu) -> pickle -> bytes -> unpickle -> frames(cpu)
+        if isinstance(frames, torch.Tensor) and frames.device.type != "cpu":
+            frames = frames.cpu()
 
         # Update batch with decoded image
         output_batch = OutputBatch(

@@ -8,7 +8,7 @@ from functools import lru_cache
 from typing import Optional
 
 import filelock
-from huggingface_hub import hf_hub_download
+from huggingface_hub import hf_hub_download, list_repo_files, model_info
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +90,7 @@ def _maybe_download_model(
 
 
 # Copied and adapted from hf_diffusers_utils.py
-def is_diffusers_model_path(model_path: str) -> True:
+def is_diffusers_model_path(model_path: str) -> bool:
     """
     Verify if the model directory contains a valid diffusers configuration.
 
@@ -98,8 +98,7 @@ def is_diffusers_model_path(model_path: str) -> True:
         model_path: Path to the model directory
 
     Returns:
-        The loaded model configuration as a dictionary if the model is a diffusers model
-        None if the model is not a diffusers model
+        True if the path looks like a diffusers pipeline directory, else False.
     """
 
     # Prefer model_index.json which indicates a diffusers pipeline
@@ -117,12 +116,102 @@ def is_diffusers_model_path(model_path: str) -> True:
     return True
 
 
-def get_is_diffusion_model(model_path: str):
-    model_path = _maybe_download_model(model_path)
-    is_diffusion_model = is_diffusers_model_path(model_path)
-    if is_diffusion_model:
-        logger.info("Diffusion model detected")
-    return is_diffusion_model
+def _get_gguf_architecture_local(path: str) -> str | None:
+    if not os.path.isfile(path) or not path.lower().endswith(".gguf"):
+        return None
+
+    try:
+        import gguf  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        reader = gguf.GGUFReader(path)
+    except Exception:
+        return None
+
+    for key in ("general.architecture", "general.name"):
+        field = reader.get_field(key)
+        if field is None:
+            continue
+        try:
+            val = field.contents()
+        except Exception:
+            continue
+        if val is None:
+            continue
+        if isinstance(val, bytes):
+            try:
+                val = val.decode("utf-8", errors="ignore")
+            except Exception:
+                val = str(val)
+        return str(val).strip().lower()
+    return None
+
+
+def _looks_like_qwen_image_gguf_local(path: str) -> bool:
+    arch = _get_gguf_architecture_local(path)
+    if arch == "qwen_image":
+        return True
+    low = os.path.basename(path).lower()
+    return low.endswith(".gguf") and "qwen" in low and "image" in low
+
+
+def _looks_like_qwen_image_gguf_repo(repo_id: str) -> bool:
+    try:
+        info = model_info(repo_id)
+        gguf_meta = getattr(info, "gguf", None) or {}
+        arch = str(gguf_meta.get("architecture", "")).strip().lower()
+        if arch == "qwen_image":
+            return True
+    except Exception:
+        pass
+    low = repo_id.lower()
+    return ("qwen" in low) and ("image" in low) and ("gguf" in low)
+
+
+def get_is_diffusion_model(model_path: str) -> bool:
+    # Local file or directory
+    if os.path.exists(model_path):
+        if os.path.isfile(model_path) and _looks_like_qwen_image_gguf_local(model_path):
+            logger.info("Qwen-Image GGUF model detected (local file).")
+            return True
+        if os.path.isdir(model_path):
+            gguf_candidates = [
+                os.path.join(model_path, f)
+                for f in os.listdir(model_path)
+                if f.lower().endswith(".gguf")
+            ]
+            for cand in gguf_candidates[:3]:
+                if _looks_like_qwen_image_gguf_local(cand):
+                    logger.info("Qwen-Image GGUF model detected (local dir).")
+                    return True
+
+        is_diffusion_model = is_diffusers_model_path(model_path)
+        if is_diffusion_model:
+            logger.info("Diffusion model detected")
+        return is_diffusion_model
+
+    # Remote model id: try diffusers model_index/config first, then GGUF heuristics.
+    try:
+        downloaded_dir = _maybe_download_model(model_path)
+        is_diffusion_model = is_diffusers_model_path(downloaded_dir)
+        if is_diffusion_model:
+            logger.info("Diffusion model detected")
+            return True
+    except Exception:
+        pass
+
+    try:
+        files = list_repo_files(model_path)
+        gguf_files = [f for f in files if f.lower().endswith(".gguf")]
+        if gguf_files and _looks_like_qwen_image_gguf_repo(model_path):
+            logger.info("Qwen-Image GGUF model detected (HF repo).")
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def get_model_path(extra_argv):

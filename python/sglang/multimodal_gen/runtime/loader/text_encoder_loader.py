@@ -180,6 +180,17 @@ class TextEncoderLoader(ComponentLoader):
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
+        model_type = str(getattr(diffusers_pretrained_config, "model_type", "") or "")
+        if model_type.startswith("qwen2_5_vl") and server_args.text_encoder_cpu_offload:
+            # The sgl-diffusion optimized Qwen2.5-VL text encoder can still OOM on 16GB GPUs
+            # during the first forward even with FSDP CPU offload (weights need to be unsharded
+            # onto GPU). When users request CPU offload, fall back to the native transformers
+            # implementation and keep it on CPU; TextEncodingStage will move the produced
+            # embeddings/masks back to the local device for the diffusion transformer.
+            logger.info(
+                "Qwen2.5-VL text encoder detected; loading via transformers on CPU to avoid CUDA OOM."
+            )
+            return self.load_native(component_model_path, server_args, "transformers")
         model_config = get_diffusers_component_config(model_path=component_model_path)
         _clean_hf_config_inplace(model_config)
         logger.debug("HF model config: %s", model_config)

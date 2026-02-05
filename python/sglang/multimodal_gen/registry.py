@@ -623,6 +623,9 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+        # Also covers Qwen-Image GGUF checkpoints which synthesize `_class_name=QwenImagePipeline`
+        # (e.g. city96/Qwen-Image-gguf and fine-tuned variants).
+        model_detectors=[lambda s: "qwenimagepipeline" in s.lower()],
     )
     register_configs(
         sampling_param_cls=QwenImage2512SamplingParams,
