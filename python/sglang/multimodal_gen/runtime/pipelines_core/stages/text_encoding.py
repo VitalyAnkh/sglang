@@ -222,7 +222,7 @@ class TextEncodingStage(PipelineStage):
                 f"Invalid return_type '{return_type}'. Expected one of: 'list', 'dict', 'stack'"
             )
 
-        target_device = device if device is not None else get_local_torch_device()
+        local_device = get_local_torch_device()
 
         for i in indices:
             tokenizer = self.tokenizers[i]
@@ -247,9 +247,16 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
+            compute_device = device if device is not None else local_device
+            if device is None:
+                # Some native transformers text encoders are intentionally kept on CPU.
+                dev = getattr(text_encoder, "device", None)
+                if isinstance(dev, torch.device) and dev.type == "cpu":
+                    compute_device = torch.device("cpu")
+
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
-            ).to(target_device)
+            ).to(compute_device)
 
             input_ids = text_inputs["input_ids"]
             is_flux_v1 = isinstance(
@@ -258,7 +265,7 @@ class TextEncodingStage(PipelineStage):
             is_flux_t5 = is_flux_v1 and i == 1
 
             if is_flux_t5:
-                attention_mask = torch.ones(input_ids.shape[:2], device=target_device)
+                attention_mask = torch.ones(input_ids.shape[:2], device=compute_device)
             else:
                 attention_mask = text_inputs["attention_mask"]
             with set_forward_context(current_timestep=0, attn_metadata=None):
@@ -271,11 +278,18 @@ class TextEncodingStage(PipelineStage):
             prompt_embeds = postprocess_func(outputs, text_inputs)
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(dtype=dtype)
+            if prompt_embeds.device != local_device:
+                prompt_embeds = prompt_embeds.to(local_device)
 
             embeds_list.append(prompt_embeds)
             if is_flux_v1:
-                pooled_embeds_list.append(outputs.pooler_output)
+                pooled = outputs.pooler_output
+                if pooled is not None and pooled.device != local_device:
+                    pooled = pooled.to(local_device)
+                pooled_embeds_list.append(pooled)
             if return_attention_mask:
+                if attention_mask.device != local_device:
+                    attention_mask = attention_mask.to(local_device)
                 attn_masks_list.append(attention_mask)
 
         # Shape results according to return_type

@@ -282,6 +282,20 @@ class PipelineConfig:
     def slice_noise_pred(self, noise, latents):
         return noise
 
+    def postprocess_cfg_noise_pred(
+        self,
+        noise_pred: torch.Tensor,
+        noise_pred_text: torch.Tensor,
+        noise_pred_uncond: torch.Tensor,
+        guidance_scale: float,
+        *,
+        batch=None,
+        server_args=None,
+    ) -> torch.Tensor:
+        """Optional hook to postprocess the CFG-combined noise prediction."""
+        del noise_pred_text, noise_pred_uncond, guidance_scale, batch, server_args
+        return noise_pred
+
     def adjust_num_frames(self, num_frames):
         return num_frames
 

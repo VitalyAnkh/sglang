@@ -20,7 +20,11 @@ from einops import rearrange
 from tqdm.auto import tqdm
 
 from sglang.multimodal_gen import envs
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType, STA_Mode
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    ModelTaskType,
+    PipelineConfig,
+    STA_Mode,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan2_2_TI2V_5B_Config,
     WanI2V480PConfig,
@@ -1243,12 +1247,21 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
-        return current_model(
+        out = current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
             guidance=guidance,
             **kwargs,
         )
+        # Normalize common diffusers-style outputs to a tensor for downstream scheduler.step.
+        # - diffusers often returns Transformer2DModelOutput(sample=...)
+        # - some implementations return a 1-tuple (sample,)
+        if isinstance(out, tuple):
+            return out[0]
+        sample = getattr(out, "sample", None)
+        if sample is not None:
+            return sample
+        return out
 
     def _predict_noise_with_cfg(
         self,
@@ -1337,6 +1350,12 @@ class DenoisingStage(PipelineStage):
 
         # Combine predictions
         if server_args.enable_cfg_parallel:
+            cfg_group = get_cfg_group()
+            has_cfg_postprocess_hook = (
+                type(server_args.pipeline_config).postprocess_cfg_noise_pred
+                is not PipelineConfig.postprocess_cfg_noise_pred
+            )
+
             # Each rank computes its partial contribution and we sum via all-reduce:
             #   final = s*cond + (1-s)*uncond
             if cfg_rank == 0:
@@ -1348,6 +1367,28 @@ class DenoisingStage(PipelineStage):
 
             noise_pred = cfg_model_parallel_all_reduce(partial)
 
+            # Apply any pipeline-specific CFG post-processing (e.g., Qwen-Image "True CFG").
+            # In CFG-parallel mode, cond/uncond are computed on different ranks, so we
+            # broadcast both to make the postprocess deterministic across the CFG group.
+            if has_cfg_postprocess_hook:
+                if cfg_group.world_size >= 2:
+                    if noise_pred_cond is None:
+                        noise_pred_cond = torch.empty_like(noise_pred)
+                    noise_pred_cond = cfg_group.broadcast(noise_pred_cond, src=0)
+
+                    if noise_pred_uncond is None:
+                        noise_pred_uncond = torch.empty_like(noise_pred)
+                    noise_pred_uncond = cfg_group.broadcast(noise_pred_uncond, src=1)
+
+                    noise_pred = server_args.pipeline_config.postprocess_cfg_noise_pred(
+                        noise_pred=noise_pred,
+                        noise_pred_text=noise_pred_cond,
+                        noise_pred_uncond=noise_pred_uncond,
+                        guidance_scale=float(current_guidance_scale),
+                        batch=batch,
+                        server_args=server_args,
+                    )
+
             if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
                 factor = float(batch.cfg_normalization)
                 pred_f = noise_pred.float()
@@ -1357,7 +1398,7 @@ class DenoisingStage(PipelineStage):
                     ori_norm = torch.linalg.vector_norm(cond_f)
                 else:
                     ori_norm = torch.empty_like(new_norm)
-                ori_norm = get_cfg_group().broadcast(ori_norm, src=0)
+                ori_norm = cfg_group.broadcast(ori_norm, src=0)
                 max_norm = ori_norm * factor
 
                 if new_norm > max_norm:
@@ -1376,7 +1417,7 @@ class DenoisingStage(PipelineStage):
                 else:
                     std_text = torch.empty_like(std_cfg)
                 # Broadcast std_text from local src=0 to all ranks in CFG group
-                std_text = get_cfg_group().broadcast(std_text, src=0)
+                std_text = cfg_group.broadcast(std_text, src=0)
                 noise_pred_rescaled = noise_pred * (std_text / std_cfg)
                 noise_pred = (
                     batch.guidance_rescale * noise_pred_rescaled
@@ -1388,6 +1429,15 @@ class DenoisingStage(PipelineStage):
             assert noise_pred_cond is not None and noise_pred_uncond is not None
             noise_pred = noise_pred_uncond + current_guidance_scale * (
                 noise_pred_cond - noise_pred_uncond
+            )
+
+            noise_pred = server_args.pipeline_config.postprocess_cfg_noise_pred(
+                noise_pred=noise_pred,
+                noise_pred_text=noise_pred_cond,
+                noise_pred_uncond=noise_pred_uncond,
+                guidance_scale=float(current_guidance_scale),
+                batch=batch,
+                server_args=server_args,
             )
 
             if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
