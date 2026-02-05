@@ -1559,12 +1559,19 @@ class DenoisingStage(PipelineStage):
         guidance: torch.Tensor,
         **kwargs,
     ):
-        return current_model(
+        out = current_model(
             hidden_states=latent_model_input,
             timestep=timestep,
             guidance=guidance,
             **kwargs,
         )
+        # Normalize common diffusers-style outputs (tuple / .sample wrapper) to a tensor.
+        if isinstance(out, tuple):
+            return out[0]
+        sample = getattr(out, "sample", None)
+        if sample is not None:
+            return sample
+        return out
 
     def _predict_noise_with_cfg(
         self,

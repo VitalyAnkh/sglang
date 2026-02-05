@@ -89,6 +89,7 @@ STANDALONE_FILES = {
     "1-gpu": [
         "../cli/test_generate_t2i_perf.py",
         "test_update_weights_from_disk.py",
+        "../test_cfg_parallel_postprocess_hook.py",
     ],
     "2-gpu": [],
 }
@@ -99,6 +100,7 @@ STANDALONE_FILES = {
 STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
         "../cli/test_generate_t2i_perf.py": 240.0,
+        "../test_cfg_parallel_postprocess_hook.py": 60.0,
         "test_update_weights_from_disk.py": 480.0,
     },
     "2-gpu": {},

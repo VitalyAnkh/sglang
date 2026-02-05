@@ -1,10 +1,9 @@
+import contextlib
 import json
 import logging
 import os
 import subprocess
 from functools import lru_cache
-
-from huggingface_hub import HfApi
 
 from sglang.srt.environ import envs
 from sglang.utils import (
@@ -47,22 +46,66 @@ def _is_diffusers_model_dir(model_dir: str) -> bool:
     return "_diffusers_version" in config
 
 
-def _is_gated_diffusion_repo(repo_id: str) -> bool:
-    """Query HF model card metadata to check if a gated repo is a diffusers model."""
+def _get_gguf_architecture_local(path: str) -> str | None:
+    if not os.path.isfile(path) or not path.lower().endswith(".gguf"):
+        return None
+
     try:
-        info = HfApi().model_info(repo_id)
-        return getattr(info, "library_name", None) == "diffusers"
+        import gguf  # type: ignore
+    except ImportError:
+        return None
+
+    try:
+        reader = gguf.GGUFReader(path)
     except Exception:
-        return False
+        return None
+
+    for key in ("general.architecture", "general.name"):
+        field = reader.get_field(key)
+        if field is None:
+            continue
+        with contextlib.suppress(Exception):
+            value = field.contents()
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="ignore")
+            text = str(value).strip()
+            if text:
+                return text.lower()
+
+    return None
+
+
+def _looks_like_qwen_image_gguf_local(path: str) -> bool:
+    arch = _get_gguf_architecture_local(path)
+    if arch == "qwen_image":
+        return True
+
+    low = os.path.basename(path).lower()
+    return low.endswith(".gguf") and ("qwen" in low) and ("image" in low)
+
+
+def _looks_like_qwen_image_gguf_repo(repo_id: str) -> bool:
+    try:
+        from huggingface_hub import model_info
+
+        info = model_info(repo_id)
+        gguf_meta = getattr(info, "gguf", None) or {}
+        arch = str(gguf_meta.get("architecture", "")).strip().lower()
+        if arch == "qwen_image":
+            return True
+    except Exception:
+        pass
+
+    low = repo_id.lower()
+    return ("qwen" in low) and ("image" in low) and ("gguf" in low)
 
 
 def get_is_diffusion_model(model_path: str) -> bool:
     """Detect whether model_path points to a diffusion model.
 
     For local directories, checks the filesystem directly.
-    For HF/ModelScope model IDs, attempts to fetch only model_index.json.
-    For gated repos where file download fails, falls back to HF model card
-    metadata (library_name == "diffusers").
+    For HF/ModelScope model IDs, attempts to fetch only model_index.json and
+    falls back to GGUF heuristics when appropriate.
     Returns False on any failure (network error, 404, offline mode, etc.)
     so that the caller falls through to the standard LLM server path.
     """
@@ -70,9 +113,27 @@ def get_is_diffusion_model(model_path: str) -> bool:
         # short-circuit, if applicable for the overlay mechanism (diffusion-only)
         return True
 
-    if os.path.isdir(model_path):
+    # Local file or directory: handle GGUF first, then fall back to diffusers/non-diffusers detection.
+    if os.path.exists(model_path):
+        if os.path.isfile(model_path):
+            if _looks_like_qwen_image_gguf_local(model_path):
+                logger.info("Qwen-Image GGUF model detected (local file).")
+                return True
+            return False
+
         if _is_diffusers_model_dir(model_path):
             return True
+
+        gguf_candidates = [
+            os.path.join(model_path, name)
+            for name in os.listdir(model_path)
+            if name.lower().endswith(".gguf")
+        ]
+        for cand in gguf_candidates[:3]:
+            if _looks_like_qwen_image_gguf_local(cand):
+                logger.info("Qwen-Image GGUF model detected (local dir).")
+                return True
+
         return is_known_non_diffusers_diffusion_model(model_path)
 
     if is_known_non_diffusers_diffusion_model(model_path):
@@ -81,6 +142,7 @@ def get_is_diffusion_model(model_path: str) -> bool:
     if _is_registered_diffusion_model(model_path):
         return True
 
+    # Remote model id: try diffusers model_index.json first, then GGUF heuristics.
     try:
         if envs.SGLANG_USE_MODELSCOPE.get():
             from modelscope import model_file_download
@@ -96,7 +158,20 @@ def get_is_diffusion_model(model_path: str) -> bool:
         return _is_diffusers_model_dir(os.path.dirname(file_path))
     except Exception as e:
         logger.debug("Failed to auto-detect diffusion model for %s: %s", model_path, e)
-        return False
+
+    try:
+        from huggingface_hub import list_repo_files
+
+        files = list_repo_files(model_path)
+        if any(f.lower().endswith(".gguf") for f in files) and _looks_like_qwen_image_gguf_repo(
+            model_path
+        ):
+            logger.info("Qwen-Image GGUF model detected (HF repo).")
+            return True
+    except Exception:
+        pass
+
+    return False
 
 
 def get_model_path(extra_argv):

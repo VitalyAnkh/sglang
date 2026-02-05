@@ -229,7 +229,7 @@ class TextEncodingStage(PipelineStage):
                 f"Invalid return_type '{return_type}'. Expected one of: 'list', 'dict', 'stack'"
             )
 
-        target_device = device if device is not None else get_local_torch_device()
+        local_device = get_local_torch_device()
 
         for i in indices:
             tokenizer = self.tokenizers[i]
@@ -256,9 +256,16 @@ class TextEncodingStage(PipelineStage):
                 **text_encoder_extra_arg,
             )
 
+            compute_device = device if device is not None else local_device
+            if device is None:
+                # Some native transformers text encoders are intentionally kept on CPU.
+                dev = getattr(text_encoder, "device", None)
+                if isinstance(dev, torch.device) and dev.type == "cpu":
+                    compute_device = torch.device("cpu")
+
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
-            ).to(target_device)
+            ).to(compute_device)
 
             input_ids = text_inputs["input_ids"]
             attention_mask = (
