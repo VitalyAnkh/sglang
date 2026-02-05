@@ -37,6 +37,8 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
+    maybe_download_model_index,
+    select_default_gguf_filename,
     verify_model_config_and_directory,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -126,6 +128,15 @@ class ComposedPipelineBase(ABC):
         self.modules[module_name] = module
 
     def _load_config(self) -> dict[str, Any]:
+        if os.path.exists(self.model_path):
+            logger.info("Model path: %s", self.model_path)
+            config = verify_model_config_and_directory(self.model_path)
+            return cast(dict[str, Any], config)
+
+        config = maybe_download_model_index(self.model_path)
+        if "gguf_files" in config or "gguf_file" in config:
+            return cast(dict[str, Any], config)
+
         model_path = maybe_download_model(self.model_path, force_diffusers_model=True)
         self.model_path = model_path
         logger.info("Model path: %s", model_path)
@@ -196,6 +207,169 @@ class ComposedPipelineBase(ABC):
 
         model_index = self._load_config()
         logger.info("Loading pipeline modules from config: %s", model_index)
+
+        # GGUF diffusion checkpoints: load base components from `gguf_base_model_id`,
+        # and transformer weights from the GGUF file.
+        if "gguf_file" in model_index or "gguf_files" in model_index:
+            base_model_id = cast(str | None, model_index.get("gguf_base_model_id"))
+            if not base_model_id:
+                raise ValueError(
+                    "GGUF model config is missing 'gguf_base_model_id'."
+                )
+
+            gguf_file = cast(str | None, model_index.get("gguf_file"))
+            if gguf_file is None:
+                gguf_files = list(cast(list[str], model_index.get("gguf_files", [])))
+                chosen = select_default_gguf_filename(sorted(gguf_files))
+
+                if os.path.exists(self.model_path):
+                    gguf_file = os.path.join(self.model_path, chosen)
+                else:
+                    from huggingface_hub import hf_hub_download
+
+                    try:
+                        gguf_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename=chosen,
+                            revision=server_args.revision,
+                            local_files_only=True,
+                        )
+                    except Exception:
+                        gguf_file = hf_hub_download(
+                            repo_id=self.model_path,
+                            filename=chosen,
+                            revision=server_args.revision,
+                        )
+
+            logger.info(
+                "GGUF diffusion checkpoint detected; loading base components from '%s' and transformer from '%s'.",
+                base_model_id,
+                gguf_file,
+            )
+
+            allow_patterns = ["model_index.json"]
+            for module_name in self.required_config_modules:
+                load_module_name = self._extra_config_module_map.get(
+                    module_name, module_name
+                )
+                if load_module_name == "transformer":
+                    allow_patterns.append("transformer/*.json")
+                else:
+                    allow_patterns.append(f"{load_module_name}/*")
+
+            from huggingface_hub import snapshot_download
+            from huggingface_hub.utils import RevisionNotFoundError
+
+            base_model_path: str | None = None
+            last_error: Exception | None = None
+            warned_revision_mismatch = False
+
+            revisions_to_try: list[str | None] = [server_args.revision]
+            if server_args.revision is not None:
+                revisions_to_try.append(None)
+
+            for local_files_only in (True, False):
+                for revision in revisions_to_try:
+                    try:
+                        base_model_path = snapshot_download(
+                            repo_id=base_model_id,
+                            revision=revision,
+                            allow_patterns=allow_patterns,
+                            ignore_patterns=["*.onnx", "*.msgpack"],
+                            local_files_only=local_files_only,
+                        )
+                        break
+                    except RevisionNotFoundError as e:
+                        last_error = e
+                        if revision is not None and not warned_revision_mismatch:
+                            warned_revision_mismatch = True
+                            logger.warning(
+                                "Revision '%s' not found for base model '%s'; downloading base components without --revision.",
+                                revision,
+                                base_model_id,
+                            )
+                    except Exception as e:
+                        last_error = e
+                        if revision is not None:
+                            break
+                if base_model_path is not None:
+                    break
+
+            if base_model_path is None:
+                raise RuntimeError(
+                    f"Failed to download base components for GGUF model from '{base_model_id}'."
+                ) from last_error
+            base_index = verify_model_config_and_directory(base_model_path)
+
+            base_index.pop("_class_name", None)
+            base_index.pop("_diffusers_version", None)
+            base_index.pop("pipeline_name", None)
+
+            model_index = {
+                required_module: base_index[required_module]
+                for required_module in self.required_config_modules
+            }
+
+            required_modules = self.required_config_modules
+            logger.info("Loading required components: %s", required_modules)
+
+            components: dict[str, Any] = {}
+            for module_name, (
+                transformers_or_diffusers,
+                _architecture,
+            ) in tqdm(iterable=model_index.items(), desc="Loading required modules"):
+                if loaded_modules is not None and module_name in loaded_modules:
+                    logger.info("Using module %s already provided", module_name)
+                    components[module_name] = loaded_modules[module_name]
+                    continue
+
+                load_module_name = self._extra_config_module_map.get(
+                    module_name, module_name
+                )
+
+                if module_name == "transformer":
+                    component_model_path = gguf_file
+                elif module_name == "vae":
+                    vae_override = server_args.component_paths.get(
+                        load_module_name, server_args.component_paths.get(module_name)
+                    )
+                    if vae_override is not None:
+                        component_model_path = vae_override
+                        if not os.path.exists(component_model_path):
+                            component_model_path = maybe_download_model(
+                                component_model_path
+                            )
+                        logger.info(
+                            "Using custom VAE path: %s instead of default path: %s",
+                            component_model_path,
+                            os.path.join(base_model_path, load_module_name),
+                        )
+                    else:
+                        component_model_path = os.path.join(
+                            base_model_path, load_module_name
+                        )
+                else:
+                    component_model_path = os.path.join(base_model_path, load_module_name)
+
+                module, memory_usage = PipelineComponentLoader.load_component(
+                    component_name=load_module_name,
+                    component_model_path=component_model_path,
+                    transformers_or_diffusers=transformers_or_diffusers,
+                    server_args=server_args,
+                )
+
+                self.memory_usages[load_module_name] = memory_usage
+                if module_name in components:
+                    logger.warning("Overwriting module %s", module_name)
+                components[module_name] = module
+
+            for module_name in required_modules:
+                if module_name not in components or components[module_name] is None:
+                    raise ValueError(
+                        f"Required module key: {module_name} value: {components.get(module_name)} was not found in loaded modules {components.keys()}"
+                    )
+
+            return components
 
         # remove keys that are not pipeline modules
         model_index.pop("_class_name")

@@ -175,9 +175,16 @@ class TextEncoderLoader(ComponentLoader):
         diffusers_pretrained_config = get_config(
             component_model_path, trust_remote_code=True
         )
-        model_config = get_diffusers_component_config(
-            component_path=component_model_path
-        )
+        model_type = str(getattr(diffusers_pretrained_config, "model_type", "") or "")
+        if model_type.startswith("qwen2_5_vl") and server_args.text_encoder_cpu_offload:
+            # Keep Qwen2.5-VL text encoder on CPU under CPU offload to avoid first-forward OOM.
+            logger.info(
+                "Qwen2.5-VL text encoder detected; loading via transformers on CPU to avoid CUDA OOM."
+            )
+            return self.load_native(component_model_path, server_args, "transformers")
+        model_config = get_diffusers_component_config(component_path=component_model_path)
+        _clean_hf_config_inplace(model_config)
+        logger.debug("HF model config: %s", model_config)
 
         def is_not_first_encoder(module_name):
             return "2" in module_name

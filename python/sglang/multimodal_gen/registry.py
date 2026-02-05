@@ -623,6 +623,7 @@ def _register_configs():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image"],
+        model_detectors=[lambda s: "qwenimagepipeline" in s.lower()],
     )
     register_configs(
         sampling_param_cls=QwenImage2512SamplingParams,

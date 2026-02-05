@@ -225,6 +225,10 @@ class DecodingStage(PipelineStage):
             trajectory_decoded = None
 
         frames = server_args.pipeline_config.post_decoding(frames, server_args)
+        # OutputBatch is pickled cross-process; keep decoded frames on CPU to avoid
+        # device re-allocation/OOM during unpickle.
+        if isinstance(frames, torch.Tensor) and frames.device.type != "cpu":
+            frames = frames.cpu()
 
         # Update batch with decoded image
         output_batch = OutputBatch(

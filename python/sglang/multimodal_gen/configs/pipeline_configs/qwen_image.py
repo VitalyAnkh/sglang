@@ -170,7 +170,8 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         return img_cos_sin_cache, txt_cos_sin_cache
 
     def _prepare_cond_kwargs(self, batch, prompt_embeds, rotary_emb, device, dtype):
-        batch_size = prompt_embeds[0].shape[0]
+        embeds = prompt_embeds[0] if isinstance(prompt_embeds, list) else prompt_embeds
+        batch_size = embeds.shape[0]
         height = batch.height
         width = batch.width
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
@@ -184,12 +185,16 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
                 )
             ]
         ] * batch_size
-        txt_seq_lens = [prompt_embeds[0].shape[1]]
+        encoder_hidden_states_mask = (
+            embeds.abs().sum(dim=-1).ne(0).to(device=device, dtype=torch.long)
+        )
+        txt_seq_lens = encoder_hidden_states_mask.sum(dim=1).tolist()
 
         if rotary_emb is None:
             return {
                 "img_shapes": img_shapes,
                 "txt_seq_lens": txt_seq_lens,
+                "encoder_hidden_states_mask": encoder_hidden_states_mask,
                 "freqs_cis": None,
             }
 
@@ -203,6 +208,7 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
             "txt_seq_lens": txt_seq_lens,
             "freqs_cis": (img_cache, txt_cache),
             "img_shapes": img_shapes,
+            "encoder_hidden_states_mask": encoder_hidden_states_mask,
         }
 
     def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
@@ -214,6 +220,21 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         return self._prepare_cond_kwargs(
             batch, batch.negative_prompt_embeds, rotary_emb, device, dtype
         )
+
+    def postprocess_cfg_noise_pred(
+        self,
+        noise_pred: torch.Tensor,
+        noise_pred_text: torch.Tensor,
+        noise_pred_uncond: torch.Tensor,
+        guidance_scale: float,
+        *,
+        batch=None,
+        server_args=None,
+    ) -> torch.Tensor:
+        # Qwen-Image "True CFG" normalization (see diffusers' QwenImagePipeline).
+        cond_norm = torch.norm(noise_pred_text, dim=-1, keepdim=True)
+        noise_norm = torch.norm(noise_pred, dim=-1, keepdim=True).clamp(min=1e-6)
+        return noise_pred * (cond_norm / noise_norm)
 
     def post_denoising_loop(self, latents, batch):
         # unpack latents for qwen-image

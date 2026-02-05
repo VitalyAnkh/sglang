@@ -38,6 +38,7 @@ SUITES = {
         # unit tests (no server needed)
         "../test_sampling_params_validate.py",
         "test_update_weights_from_disk.py",
+        "../test_cfg_parallel_postprocess_hook.py",
         # add new 1-gpu test files here
     ],
     "2-gpu": [
