@@ -1,5 +1,6 @@
 import copy
 import logging
+from contextlib import contextmanager
 from typing import Any
 
 import torch
@@ -96,6 +97,24 @@ class _QwenImageDiffusersTransformerWrapper(nn.Module):
         super().__init__()
         self.inner = inner
 
+    @contextmanager
+    def _use_precomputed_pos_embed(self, freqs_cis):
+        pos_embed = getattr(self.inner, "pos_embed", None)
+        if pos_embed is None or freqs_cis is None:
+            yield
+            return
+
+        original_forward = pos_embed.forward
+
+        def forward_with_precomputed(*_args, **_kwargs):
+            return freqs_cis
+
+        pos_embed.forward = forward_with_precomputed
+        try:
+            yield
+        finally:
+            pos_embed.forward = original_forward
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -114,20 +133,18 @@ class _QwenImageDiffusersTransformerWrapper(nn.Module):
         if isinstance(encoder_hidden_states_mask, list):
             encoder_hidden_states_mask = encoder_hidden_states_mask[0]
 
-        if timestep is not None:
-            timestep = timestep.to(dtype=hidden_states.dtype) / 1000.0
-
-        out = self.inner(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_hidden_states_mask=encoder_hidden_states_mask,
-            timestep=timestep,
-            img_shapes=img_shapes,
-            txt_seq_lens=txt_seq_lens,
-            guidance=guidance,
-            attention_kwargs=attention_kwargs,
-            return_dict=False,
-        )
+        with self._use_precomputed_pos_embed(freqs_cis):
+            out = self.inner(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_hidden_states_mask=encoder_hidden_states_mask,
+                timestep=timestep,
+                img_shapes=img_shapes,
+                txt_seq_lens=txt_seq_lens,
+                guidance=guidance,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )
         return out[0]
 
 

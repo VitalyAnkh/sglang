@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 )
 from sglang.multimodal_gen.runtime.loader.fsdp_load import shard_model
 from sglang.multimodal_gen.runtime.loader.utils import (
+    _clean_hf_config_inplace,
     set_default_torch_dtype,
     skip_init_modules,
 )

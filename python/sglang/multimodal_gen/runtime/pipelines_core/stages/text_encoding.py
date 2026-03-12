@@ -230,6 +230,7 @@ class TextEncodingStage(PipelineStage):
             )
 
         local_device = get_local_torch_device()
+        target_device = device if device is not None else local_device
 
         for i in indices:
             tokenizer = self.tokenizers[i]

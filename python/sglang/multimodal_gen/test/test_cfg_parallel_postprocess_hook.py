@@ -29,23 +29,25 @@ def test_cfg_parallel_applies_cfg_postprocess_hook(monkeypatch):
         def __init__(self):
             self.called = 0
 
+        def get_classifier_free_guidance_scale(self, batch, guidance_scale: float):
+            return guidance_scale
+
         def slice_noise_pred(self, noise_pred: torch.Tensor, latents: torch.Tensor):
             return noise_pred
 
-        def postprocess_cfg_noise_pred(
-            self,
-            noise_pred: torch.Tensor,
-            noise_pred_text: torch.Tensor,
-            noise_pred_uncond: torch.Tensor,
-            guidance_scale: float,
-            *,
-            batch=None,
-            server_args=None,
+        def postprocess_cfg_noise(
+            self, batch, noise_pred: torch.Tensor, noise_pred_text: torch.Tensor
         ) -> torch.Tensor:
             self.called += 1
-            return noise_pred + noise_pred_text + noise_pred_uncond
+            return noise_pred + noise_pred_text
 
     class DummyStage:
+        _apply_model_specific_cfg_postprocess = (
+            DenoisingStage._apply_model_specific_cfg_postprocess
+        )
+        _combine_cfg_parallel = DenoisingStage._combine_cfg_parallel
+        _combine_cfg_serial = DenoisingStage._combine_cfg_serial
+
         def _predict_noise(self, **kwargs):
             return uncond if kwargs.get("_which") == "uncond" else cond
 
@@ -87,9 +89,11 @@ def test_cfg_parallel_applies_cfg_postprocess_hook(monkeypatch):
             "cfg_model_parallel_all_reduce",
             fake_all_reduce,
         )
+        stage = DummyStage()
+        stage.server_args = server_args
 
         out = DenoisingStage._predict_noise_with_cfg(
-            DummyStage(),
+            stage,
             current_model=None,
             latent_model_input=torch.zeros_like(cond),
             timestep=torch.tensor([0]),
@@ -108,4 +112,4 @@ def test_cfg_parallel_applies_cfg_postprocess_hook(monkeypatch):
 
         assert torch.allclose(captured["partial"], expected_partial)
         assert pipeline_config.called == 1
-        assert torch.allclose(out, expected_cfg + cond + uncond)
+        assert torch.allclose(out, expected_cfg + cond)
