@@ -751,6 +751,38 @@ class TestMiniMaxH3Routing(unittest.TestCase):
         )
 
 
+class TestSenseNovaU1Routing(unittest.TestCase):
+    def test_preview_id_skips_diffusers_model_index(self):
+        self.assertEqual(
+            get_non_diffusers_pipeline_name(
+                "sensenova/SenseNova-U1.5-8B-MoT-Preview"
+            ),
+            "SenseNovaU1Pipeline",
+        )
+        self.assertTrue(
+            is_known_non_diffusers_multimodal_model(
+                "sensenova/SenseNova-U1.5-8B-MoT-Preview"
+            )
+        )
+
+    def test_hf_cache_path_and_official_id_match(self):
+        cache_path = (
+            "/home/user/.cache/huggingface/hub/"
+            "models--sensenova--SenseNova-U1.5-8B-MoT-Preview/snapshots/abc"
+        )
+        self.assertEqual(
+            get_non_diffusers_pipeline_name(cache_path),
+            "SenseNovaU1Pipeline",
+        )
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("sensenova/SenseNova-U1.5-8B-MoT"),
+            "SenseNovaU1Pipeline",
+        )
+
+    def test_generic_neo_chat_does_not_match(self):
+        self.assertIsNone(get_non_diffusers_pipeline_name("some-org/neo_chat-other"))
+
+
 class TestOffloadDefaults(unittest.TestCase):
     def test_wan_decode_precision_defaults(self):
         for pipeline_config in (

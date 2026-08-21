@@ -303,6 +303,10 @@ class ServerArgs(DisaggServerArgsMixin):
 
     # Pre-quantized transformer weights: safetensors file/directory or GGUF file.
     transformer_weights_path: str | None = None
+    # SenseNova U1 / NEO-Unify wrap: community GGUF + official layer-offload mode.
+    # Load-time only; sampling extras cannot place weights.
+    gguf_checkpoint: str | None = None
+    vram_mode: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
     # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
@@ -532,6 +536,17 @@ class ServerArgs(DisaggServerArgsMixin):
         expand_path_fields(self)
         self._adjust_save_paths()
 
+    def _adjust_sensenova_offload(self):
+        allowed = ("full", "fast", "balanced", "low")
+        if self.vram_mode is not None and self.vram_mode not in allowed:
+            raise ValueError(
+                f"Invalid --vram-mode {self.vram_mode!r}; expected one of {allowed}."
+            )
+        if self.gguf_checkpoint:
+            self.gguf_checkpoint = os.path.expanduser(self.gguf_checkpoint)
+            if self.vram_mode is None:
+                self.vram_mode = "balanced"
+
     def _adjust_parameters(self):
         """set defaults and normalize values."""
         self._normalize_component_residency()
@@ -547,6 +562,7 @@ class ServerArgs(DisaggServerArgsMixin):
             auto_tuner.maybe_adjust_auto_component_residency_after_offload()
             auto_tuner.maybe_replace_cpu_offloaded_components_with_layerwise()
         self._adjust_path()
+        self._adjust_sensenova_offload()
         if self.served_model_name is None:
             self.served_model_name = self.model_id or self.model_path
         self._adjust_quant_config()
@@ -2507,6 +2523,21 @@ class ServerArgs(DisaggServerArgsMixin):
             help='Directory path to save uploaded input images/videos. Set to "" to disable persistent saving.',
         )
 
+        parser.add_argument(
+            "--gguf-checkpoint",
+            type=str,
+            default=ServerArgs.gguf_checkpoint,
+            help="Path to a SenseNova U1 GGUF weight file. Load-time only; "
+            "must match the --model-path config (Preview GGUF with Preview).",
+        )
+        parser.add_argument(
+            "--vram-mode",
+            type=str,
+            choices=["full", "fast", "balanced", "low"],
+            default=ServerArgs.vram_mode,
+            help="SenseNova U1 layer-offload mode from the official transformers "
+            "path. Defaults to balanced when --gguf-checkpoint is set.",
+        )
         # LoRA
         parser.add_argument(
             "--lora-path",

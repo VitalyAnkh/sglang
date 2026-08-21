@@ -99,6 +99,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.sense_nova_u1 import (
+    SenseNovaU1PipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.stablediffusion3 import (
     StableDiffusion3PipelineConfig,
 )
@@ -174,6 +177,7 @@ from sglang.multimodal_gen.configs.sample.qwenimage import (
 from sglang.multimodal_gen.configs.sample.sana import SanaSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_video import SanaVideoSamplingParams
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.sample.sense_nova_u1 import SenseNovaU1SamplingParams
 from sglang.multimodal_gen.configs.sample.stablediffusion3 import (
     StableDiffusion3SamplingParams,
 )
@@ -344,6 +348,9 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
+    "sensenova/sensenova-u1.5-8b-mot-preview": "SenseNovaU1Pipeline",
+    "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
+    "sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
 }
 
 
@@ -1127,6 +1134,17 @@ def _register_configs():
         sampling_param_cls=GlmImageSamplingParams,
         pipeline_config_cls=GlmImagePipelineConfig,
         model_detectors=[lambda hf_id: "glm-image" in hf_id.lower()],
+    )
+    register_configs(
+        sampling_param_cls=SenseNovaU1SamplingParams,
+        pipeline_config_cls=SenseNovaU1PipelineConfig,
+        hf_model_paths=[
+            "sensenova/SenseNova-U1.5-8B-MoT-Preview",
+            "sensenova/SenseNova-U1.5-8B-MoT",
+        ],
+        model_detectors=[
+            lambda hf_id: "sensenova-u1.5-8b-mot" in hf_id.lower().replace("_", "-"),
+        ],
     )
     register_configs(
         sampling_param_cls=Hunyuan3DSamplingParams,
