@@ -752,23 +752,18 @@ class TestMiniMaxH3Routing(unittest.TestCase):
 
 
 class TestSenseNovaU1Routing(unittest.TestCase):
-    def test_preview_id_skips_diffusers_model_index(self):
+    def test_preview_id_still_routes_so_loader_can_reject(self):
         self.assertEqual(
             get_non_diffusers_pipeline_name(
                 "sensenova/SenseNova-U1.5-8B-MoT-Preview"
             ),
             "SenseNovaU1Pipeline",
         )
-        self.assertTrue(
-            is_known_non_diffusers_multimodal_model(
-                "sensenova/SenseNova-U1.5-8B-MoT-Preview"
-            )
-        )
 
     def test_hf_cache_path_and_official_id_match(self):
         cache_path = (
             "/home/user/.cache/huggingface/hub/"
-            "models--sensenova--SenseNova-U1.5-8B-MoT-Preview/snapshots/abc"
+            "models--sensenova--SenseNova-U1.5-8B-MoT/snapshots/abc"
         )
         self.assertEqual(
             get_non_diffusers_pipeline_name(cache_path),
@@ -781,6 +776,12 @@ class TestSenseNovaU1Routing(unittest.TestCase):
 
     def test_generic_neo_chat_does_not_match(self):
         self.assertIsNone(get_non_diffusers_pipeline_name("some-org/neo_chat-other"))
+
+    def test_server_args_has_no_gguf_or_vram_mode(self):
+        from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+        self.assertNotIn("gguf_checkpoint", ServerArgs.__dataclass_fields__)
+        self.assertNotIn("vram_mode", ServerArgs.__dataclass_fields__)
 
 
 class TestOffloadDefaults(unittest.TestCase):

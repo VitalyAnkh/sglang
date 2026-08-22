@@ -28,8 +28,8 @@ class SenseNovaU1SamplingParams(SamplingParams):
     data_type: DataType = DataType.IMAGE
     num_frames: int = 1
     negative_prompt: str = ""
-    guidance_scale: float = 4.0
-    num_inference_steps: int = 50
+    guidance_scale: float = 1.0
+    num_inference_steps: int = 8
     timestep_shift: float = 3.0
     cfg_norm: str = "none"
     _default_width: ClassVar[int | None] = 2048

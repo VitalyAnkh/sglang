@@ -348,7 +348,7 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "fal/ideogram-v4-fast": "Ideogram4FastPipeline",
     "fal/ideogram-v4-instant": "Ideogram4InstantPipeline",
     "comfy-org/ideogram-4": "Ideogram4Nvfp4Pipeline",
-    "sensenova/sensenova-u1.5-8b-mot-preview": "SenseNovaU1Pipeline",
+    # Preview ids still match this substring so load_modules can reject them.
     "sensenova/sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
     "sensenova-u1.5-8b-mot": "SenseNovaU1Pipeline",
 }
@@ -1139,7 +1139,6 @@ def _register_configs():
         sampling_param_cls=SenseNovaU1SamplingParams,
         pipeline_config_cls=SenseNovaU1PipelineConfig,
         hf_model_paths=[
-            "sensenova/SenseNova-U1.5-8B-MoT-Preview",
             "sensenova/SenseNova-U1.5-8B-MoT",
         ],
         model_detectors=[
